@@ -178,7 +178,7 @@ flowchart TD
 | `/login/` | Django `LoginView` | — | GET · POST | Session login (custom template) |
 | `/logout/` | Django `LogoutView` | — | POST | Session logout → login page |
 | `/upload/` | `upload` | ✔ | GET · POST | Archive a story |
-| `/profile/` | `profile` | ✔ | GET | Contributor dashboard |
+| `/profile/` | `profile` | — | GET | Contributor dashboard (linked only for signed-in users) |
 | `/profile/edit/` | `edit_profile` | ✔ | GET · POST | Edit bio |
 | `/story/all/` | `story_list` | ✔ | GET | Contributor's own uploads |
 | `/story/<id>/delete/` | `delete_story` | ✔ | GET · POST | Confirm & delete (owner, ≤ 24 h) |
