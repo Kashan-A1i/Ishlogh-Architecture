@@ -156,7 +156,7 @@ erDiagram
 
 ## Demo & Visuals
 
-> **Live Deployment:** **[Visit Ishlogh Live Archive](https://your-live-url.example.com)** *(placeholder — update with live URL)*
+> **Live Deployment:** **[ishlogh-app.onrender.com](https://ishlogh-app.onrender.com)** *(currently paused / offline)*
 
 ### Interactive Walkthrough
 
@@ -173,8 +173,6 @@ erDiagram
 | :---: | :---: |
 | ![Upload Progress](./assets/upload-progress.png) | ![Profile Dashboard](./assets/profile-dashboard.png) |
 | *Asynchronous XHR audio upload with real-time progress bar* | *Contributor metrics: total stories, unique regions, and recent tales* |
-
-*(See [ASSETS_CHECKLIST.md](./ASSETS_CHECKLIST.md) for instructions on capturing and dropping these visuals into `./assets/`.)*
 
 ---
 
