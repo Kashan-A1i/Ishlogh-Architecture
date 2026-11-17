@@ -1,378 +1,166 @@
-<div align="center">
-
-# 🏛 Ishlogh — Architecture Deep-Dive
-
-<sub>Request lifecycle · state management · storage & caching · scalability · security</sub>
+# Ishlogh — Architecture & Technical Deep-Dive
 
 [← Back to README](./README.md)
 
-</div>
+This document breaks down the internal architecture, request lifecycle, state management, storage strategy, and security posture of **Ishlogh**.
 
 ---
 
-## Contents
+## 1. Codebase Structure
 
-1. [Architectural Style](#1-architectural-style)
-2. [Codebase Topology](#2-codebase-topology)
-3. [Request Lifecycle](#3-request-lifecycle)
-4. [Routing Map](#4-routing-map)
-5. [State Management](#5-state-management)
-6. [Storage & Caching Strategy](#6-storage--caching-strategy)
-7. [Configuration & Environments](#7-configuration--environments)
-8. [Build & Deployment Pipeline](#8-build--deployment-pipeline)
-9. [Security Model](#9-security-model)
-10. [Scalability & Performance](#10-scalability--performance)
-11. [Trade-offs & Future Work](#11-trade-offs--future-work)
-
----
-
-## 1. Architectural Style
-
-Ishlogh is a **server-rendered modular monolith** built on Django 4.2 LTS. This was a deliberate choice for a small, content-centric product:
-
-| Concern | Choice | Why |
-| :--- | :--- | :--- |
-| Rendering | Server-side Django Templates | Fast first paint on low-bandwidth mobile networks, SEO-friendly story pages, no SPA build tooling. |
-| Interactivity | Progressive enhancement with vanilla JS | Only the upload flow needs client logic; every page still works as a plain HTML form. |
-| Domain | Single Django app (`folk`) | One bounded context — *stories and their contributors* — keeps the codebase cohesive. |
-| Persistence | Relational DB + object storage | Structured metadata in SQL, large binaries in a bucket; each in the store best suited to it. |
-| Hosting | PaaS (Render) + managed services | No servers to patch; the app is twelve-factor so the host is replaceable. |
-
----
-
-## 2. Codebase Topology
-
-High-level layout (structure only — no source shown):
+Ishlogh is organized as a focused Django 4.2 monolith with a single domain app (`folk`):
 
 ```text
-Ishlogh/                      ← repository root
-├── Ishlogh/                  ← Django project package
-│   ├── settings.py           ← env-driven config: DB, storage, auth routing, logging
-│   ├── urls.py               ← root URLConf + /ping/ health check
-│   ├── wsgi.py / asgi.py     ← server entry points
-│   └── Procfile              ← process definition (gunicorn)
-├── folk/                     ← the single domain app
-│   ├── models.py             ← Story, Region, Language, UserProfile + signals
-│   ├── forms.py              ← StoryForm, CustomSignupForm, ProfileUpdateForm
-│   ├── views.py              ← function-based views
-│   ├── urls.py               ← app routes
-│   ├── admin.py              ← model registration for the Django admin
-│   ├── migrations/           ← 6 migrations tracing the schema's evolution
-│   ├── templates/folk/       ← 11 templates extending a shared master layout
-│   └── static/folk/          ← per-page CSS, upload.js, backdrop imagery
-├── build.sh                  ← Render build script
-├── gunicorn.conf.py          ← worker timeout tuning
-└── requirements.txt          ← pinned dependencies
+Ishlogh/
+├── Ishlogh/                  # Project configuration package
+│   ├── settings.py           # Env-driven DB, B2 storage, WhiteNoise, logging
+│   ├── urls.py               # Root URL dispatcher + /ping/ health endpoint
+│   ├── wsgi.py / asgi.py     # Server entrypoints
+│   └── Procfile              # Gunicorn process specification
+├── folk/                     # Core folklore archive application
+│   ├── models.py             # Story, Region, Language, UserProfile + post_save signals
+│   ├── forms.py              # StoryForm (YouTube regex parser), CustomSignupForm, ProfileUpdateForm
+│   ├── views.py              # Function-based views & permission enforcement
+│   ├── urls.py               # Application routes
+│   ├── admin.py              # Admin registration for curation
+│   ├── migrations/           # 6 sequential schema migrations
+│   ├── templates/folk/       # 11 HTML templates inheriting from master.html
+│   └── static/folk/          # Per-page CSS stylesheets, upload.js, responsive backdrops
+├── build.sh                  # Render CI/CD build script (install -> collectstatic -> migrate)
+├── gunicorn.conf.py          # Worker timeout configuration (120s)
+└── requirements.txt          # Pinned production dependencies
 ```
-
-**Layering inside `folk`:**
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'fontFamily': 'Georgia, serif', 'primaryColor': '#f4f0e6', 'primaryTextColor': '#1a1613', 'primaryBorderColor': '#4a3e35', 'lineColor': '#8c7a6b' }}}%%
-graph LR
-    T["Templates<br/>presentation"] --> V["Views<br/>orchestration · authz"]
-    V --> F["Forms<br/>validation · input normalization"]
-    F --> M["Models<br/>persistence · domain rules"]
-    V --> M
-    M --> S["Signals<br/>side effects"]
-    M --> FS["Storage API<br/>files"]
-
-    classDef layer fill:#f4f0e6,stroke:#4a3e35,color:#1a1613
-    class T,V,F,M,S,FS layer
-```
-
-Domain rules sit as close to the data as possible: name canonicalization lives in `Model.save()`, the deletion window is a model property, and URL→ID extraction lives in form cleaning — so views stay thin.
 
 ---
 
-## 3. Request Lifecycle
+## 2. Request Lifecycle
 
-### 3.1 Generic request path
+### 2.1 Middleware Pipeline
+
+Every incoming HTTP request passes through an ordered 8-layer middleware stack in `Ishlogh/settings.py`:
+
+1. **`SecurityMiddleware`** — Enforces baseline security headers.
+2. **`WhiteNoiseMiddleware`** — Intercepts `/static/*` requests immediately, serving compressed, content-hashed assets without touching sessions or the database.
+3. **`SessionMiddleware`** — Hydrates session state from PostgreSQL.
+4. **`CommonMiddleware`** — Normalizes URLs.
+5. **`CsrfViewMiddleware`** — Validates CSRF tokens on all mutating (`POST`) requests before any view executes.
+6. **`AuthenticationMiddleware`** — Binds `request.user` from the active session.
+7. **`MessageMiddleware`** — Manages one-time flash notifications (used for deletion and permission feedback).
+8. **`XFrameOptionsMiddleware`** — Sets `X-Frame-Options` to prevent clickjacking.
+
+### 2.2 Multi-Modal Story Upload Flow
+
+Archiving a story with an audio recording involves coordinated work across the browser, Gunicorn, Django forms, Backblaze B2, and PostgreSQL:
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'fontFamily': 'Georgia, serif', 'actorBkg': '#f4f0e6', 'actorBorder': '#4a3e35', 'actorTextColor': '#1a1613', 'signalColor': '#4a3e35', 'noteBkgColor': '#e3d2bc', 'noteBorderColor': '#8c7a6b' }}}%%
 sequenceDiagram
     autonumber
-    participant B as Browser
-    participant E as Render Edge (TLS)
-    participant G as Gunicorn Worker
-    participant MW as Middleware Chain
-    participant R as URL Resolver
-    participant V as View
+    actor User as Contributor
+    participant JS as upload.js (XHR)
+    participant Web as Gunicorn / Django
+    participant Form as StoryForm
+    participant B2 as Backblaze B2 (S3)
     participant DB as PostgreSQL
-    participant T as Template Engine
 
-    B->>E: HTTPS request
-    E->>G: proxied HTTP
-    G->>MW: WSGI environ
-    Note over MW: SecurityMiddleware → WhiteNoise<br/>(short-circuits /static/) → Session → Common<br/>→ CSRF → Authentication → Messages → XFrameOptions
-    MW->>R: HttpRequest (request.user, session attached)
-    R->>V: matched view + kwargs
-    V->>DB: ORM queries (fresh connection, conn_max_age=0)
-    DB-->>V: rows
-    V->>T: render(context)
-    T-->>V: HTML
-    V-->>MW: HttpResponse
-    MW-->>G: headers added (X-Frame-Options, security headers)
-    G-->>B: response
+    User->>JS: Submit #storyForm
+    JS->>JS: preventDefault(), disable buttons, show #progressBar
+    JS->>Web: POST /upload/ (multipart/form-data + CSRF token)
+    loop Upload Stream
+        JS-->>User: xhr.upload.onprogress updates % complete
+    end
+    Web->>Form: StoryForm(request.POST, request.FILES)
+    Form->>Form: clean_youtube_url() extracts 11-char video ID
+    alt Validation Fails
+        Web-->>JS: 200 OK (re-rendered form with errors)
+        JS-->>User: Reset progress bar & display error state
+    else Validation Succeeds
+        Web->>Web: Assign new_story.uploader = request.user
+        Web->>B2: PutObject to audio/stories/ via S3Storage
+        B2-->>Web: 200 OK
+        Web->>DB: INSERT INTO folk_story
+        Web-->>JS: 302 Redirect -> / (followed by XHR)
+        JS->>JS: Detect redirect via xhr.responseURL
+        JS-->>User: Navigate to Home Feed
+    end
 ```
 
-**Middleware ordering matters:**
-
-- **WhiteNoise sits directly after `SecurityMiddleware`**, so static asset requests are answered before sessions, CSRF or auth are ever evaluated — static traffic never touches the database.
-- **`CsrfViewMiddleware` precedes `AuthenticationMiddleware`**, rejecting forged POSTs before any user-scoped logic runs.
-- **`XFrameOptionsMiddleware`** adds clickjacking protection to every response, which is important for pages that host destructive actions (delete confirmation).
-
-### 3.2 Authenticated write path — archiving a story
-
-| Step | Layer | What happens |
-| :---: | :--- | :--- |
-| 1 | Browser | `upload.js` intercepts submit, builds `FormData`, sends via XHR with progress events. |
-| 2 | Gunicorn | Worker accepts a long-running request (120 s timeout instead of the 30 s default). |
-| 3 | Middleware | CSRF token from the form payload is validated; session resolves `request.user`. |
-| 4 | View | `@login_required` redirects anonymous users to `/login/?next=/upload/`. |
-| 5 | Upload handler | Files ≤ 10 MB are buffered in memory; larger files stream to a temp file. |
-| 6 | Form | Model fields validated; Region/Language validated as existing PKs; YouTube URL reduced to an ID. |
-| 7 | View | `save(commit=False)` → server sets `uploader = request.user` (never trusted from client input). |
-| 8 | Storage | `FileField` pushes the file to the bucket under `audio/stories/` via the S3 API. |
-| 9 | ORM | Row inserted into `folk_story`. |
-| 10 | Response | `302 → home`; XHR follows it, `upload.js` reads `responseURL` and navigates. |
-
-### 3.3 Destructive path — deleting a story
+### 2.3 Time-Boxed Story Deletion Flow
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'fontFamily': 'Georgia, serif', 'primaryColor': '#f4f0e6', 'primaryTextColor': '#1a1613', 'primaryBorderColor': '#4a3e35', 'lineColor': '#8c7a6b' }}}%%
 flowchart TD
-    A["Request /story/&lt;id&gt;/delete/"] --> B{"Authenticated?"}
-    B -- no --> L["302 → /login/?next=…"]
-    B -- yes --> C{"Story exists?"}
-    C -- no --> N["404"]
-    C -- yes --> D{"request.user == uploader?"}
-    D -- no --> E1["flash error → story page"]
-    D -- yes --> F{"now &lt; created_at + 24h?"}
-    F -- no --> E2["flash 'window closed' → story page"]
-    F -- yes --> G{"HTTP method"}
-    G -- GET --> H["Render confirmation page"]
-    G -- POST + CSRF --> I["story.delete()"]
-    I --> J["django-cleanup removes audio object from bucket"]
-    J --> K["flash success → profile"]
-
-    classDef bad fill:#f4e1e1,stroke:#b33939,color:#1a1613
-    classDef good fill:#e8efe2,stroke:#4a6b3a,color:#1a1613
-    classDef node fill:#f4f0e6,stroke:#4a3e35,color:#1a1613
-    class L,N,E1,E2 bad
-    class I,J,K good
-    class A,B,C,D,F,G,H node
+    Req["Request /story/<id>/delete/"] --> Auth{"Authenticated?"}
+    Auth -->|No| Login["302 Redirect to /login/"]
+    Auth -->|Yes| Lookup["get_object_or_404(Story, id=id)"]
+    Lookup --> Owner{"story.uploader == request.user?"}
+    Owner -->|No| ErrOwner["Flash error & redirect to Story page"]
+    Owner -->|Yes| Window{"now < created_at + 24h?"}
+    Window -->|No| ErrWindow["Flash 24h window closed & redirect"]
+    Window -->|Yes| Method{"HTTP Method"}
+    Method -->|GET| Confirm["Render confirm_delete.html"]
+    Method -->|POST + CSRF| Delete["story.delete()"]
+    Delete --> Cleanup["django-cleanup deletes audio blob in B2"]
+    Cleanup --> Done["Flash success & redirect to /profile/"]
 ```
 
 ---
 
-## 4. Routing Map
+## 3. Application Routing Table
 
-| Route | View | Auth | Methods | Purpose |
+Routes are mounted at both `/` and `/folk/` in `Ishlogh/urls.py`:
+
+| Path | View | Auth Required | Methods | Description |
 | :--- | :--- | :---: | :---: | :--- |
-| `/` | `home` | — | GET | Archive feed (all stories, newest first) |
-| `/about/` | `about` | — | GET | Project mission |
-| `/story/<id>/` | `view_story` | — | GET | Reading view with media |
-| `/signup/` | `signup_view` | — | GET · POST | Registration + automatic login |
-| `/login/` | Django `LoginView` | — | GET · POST | Session login (custom template) |
-| `/logout/` | Django `LogoutView` | — | POST | Session logout → login page |
-| `/upload/` | `upload` | ✔ | GET · POST | Archive a story |
-| `/profile/` | `profile` | — | GET | Contributor dashboard (linked only for signed-in users) |
-| `/profile/edit/` | `edit_profile` | ✔ | GET · POST | Edit bio |
-| `/story/all/` | `story_list` | ✔ | GET | Contributor's own uploads |
-| `/story/<id>/delete/` | `delete_story` | ✔ | GET · POST | Confirm & delete (owner, ≤ 24 h) |
-| `/ping/` | inline view | — | GET | Health check → `"OK"` |
-| `/admin/` | Django admin | staff | — | Curation of stories, regions, languages, profiles |
-
-> The app URLConf is mounted at both `/` and `/folk/`, preserving backwards-compatible links from an earlier URL scheme while named routes (`{% url %}`) always resolve to the canonical root paths.
+| `/` | `views.home` | No | `GET` | Archive home feed ordered by `-created_at` |
+| `/about/` | `views.about` | No | `GET` | Mission statement & cultural background |
+| `/story/<int:story_id>/` | `views.view_story` | No | `GET` | Full story text, HTML5 audio player, YouTube embed |
+| `/signup/` | `views.signup_view` | No | `GET`, `POST` | User registration + auto-login + signal profile creation |
+| `/login/` | `LoginView` | No | `GET`, `POST` | Session authentication (`folk/login.html`) |
+| `/logout/` | `LogoutView` | — | `POST` | Terminates session and redirects to `login` |
+| `/upload/` | `views.upload` | Yes | `GET`, `POST` | Multipart story + audio upload |
+| `/profile/` | `views.profile` | — | `GET` | Contributor bio, total stories, distinct regions count, recent 3 stories |
+| `/profile/edit/` | `views.edit_profile` | Yes | `GET`, `POST` | Update contributor bio (`UserProfile`) |
+| `/story/all/` | `views.story_list` | Yes | `GET` | Complete chronological list of the user's uploaded stories |
+| `/story/<int:id>/delete/` | `views.delete_story` | Yes | `GET`, `POST` | 2-step deletion gated by ownership and 24h window |
+| `/ping/` | `ping_view` | No | `GET` | Lightweight `"OK"` health check for uptime monitors |
 
 ---
 
-## 5. State Management
+## 4. State Management & Data Integrity
 
-Ishlogh keeps **no state in the web process**. Every kind of state has an explicit home:
+Ishlogh keeps the web tier completely **stateless**:
 
-| State | Where it lives | Mechanism |
+- **Session & Auth State:** Stored in PostgreSQL (`django.contrib.sessions`), allowing any Gunicorn worker to authenticate any request.
+- **Signal-Driven Profile Provisioning:** Two `post_save` receivers on `django.contrib.auth.models.User` automatically create and save a 1:1 `UserProfile` whenever a user registers. Profile views also use `UserProfile.objects.get_or_create(user=user)` so legacy or CLI-created superusers never trigger `RelatedObjectDoesNotExist`.
+- **Model-Level Canonicalization:** Both `Region.save()` and `Language.save()` normalize `self.name = self.name.title()` before writing to the database, preventing duplicate taxonomy entries caused by inconsistent capitalization.
+- **Computed Domain Properties:** Rather than running a background cron job to flip a boolean flag after 24 hours, `Story.can_be_deleted` computes `timezone.now() < self.created_at + timedelta(hours=24)` dynamically using timezone-aware UTC timestamps (`USE_TZ = True`).
+
+---
+
+## 5. Storage & Caching Strategy
+
+| Storage Tier | Implementation | Architectural Details |
 | :--- | :--- | :--- |
-| Identity / login | PostgreSQL `django_session` table | Database-backed sessions, session cookie on the client |
-| Flash messages | Cookie → session fallback | Django messages framework (`FallbackStorage`) |
-| CSRF secret | Cookie + hidden form field | `CsrfViewMiddleware` double-submit validation |
-| Domain data | PostgreSQL | Django ORM |
-| Media binaries | Object storage bucket | `STORAGES["default"]` → `S3Storage` |
-| Static assets | Build artefact on disk | `collectstatic` → WhiteNoise |
-| Upload progress | Browser memory only | XHR `progress` events — never round-trips to the server |
-| Derived state | Computed on read | `can_be_deleted`, distinct-region counts, story counts |
-
-**Derived over stored.** Values like "can this story still be deleted?" or "how many regions has this contributor covered?" are computed at read time rather than persisted, eliminating a whole class of stale-flag bugs and background jobs.
-
-**Profile lifecycle via signals.** A `post_save` receiver on `auth.User` creates the one-to-one `UserProfile` at registration, and a second receiver persists profile changes when the user is saved. Views call `get_or_create()` as a belt-and-braces fallback, so accounts created outside the signup flow self-heal on first visit.
+| **Relational Data** | PostgreSQL (`dj-database-url`) | Configured with `conn_max_age=0` so connections close cleanly at the end of each request, preventing connection exhaustion on managed PostgreSQL tiers. Falls back to `db.sqlite3` when `DATABASE_URL` is absent. |
+| **Cloud Object Storage** | Backblaze B2 (`S3Storage`) | Activated automatically when `B2_BUCKET_NAME` is present in the environment. Uses a custom `botocore.config.Config` (`request_checksum_calculation="when_required"`, `response_checksum_validation="when_required"`) for S3 API compatibility. |
+| **Orphaned Media Cleanup** | `django-cleanup` | Registered in `INSTALLED_APPS` (`CleanupConfig`). Listens to model deletion and file-replacement signals to automatically remove stale audio files from Backblaze B2. |
+| **Static Assets** | WhiteNoise | Uses `CompressedManifestStaticFilesStorage` in production to gzip and fingerprint CSS, JS, and backdrop images during `build.sh`, enabling long-lived browser caching without an external CDN. |
+| **Upload Buffering** | Django Upload Handlers | `FILE_UPLOAD_MAX_MEMORY_SIZE` and `DATA_UPLOAD_MAX_MEMORY_SIZE` are set to `10485760` (10 MB). Uploads under 10 MB stay in memory; larger files stream from temporary disk storage to B2. |
 
 ---
 
-## 6. Storage & Caching Strategy
+## 6. Security Controls
 
-### 6.1 Three-tier storage
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'fontFamily': 'Georgia, serif', 'primaryColor': '#f4f0e6', 'primaryTextColor': '#1a1613', 'primaryBorderColor': '#4a3e35', 'lineColor': '#8c7a6b', 'clusterBkg': '#faf7f0', 'clusterBorder': '#8c7a6b' }}}%%
-graph LR
-    subgraph HOT["Structured · transactional"]
-        PG[("PostgreSQL<br/>metadata · users · sessions")]
-    end
-    subgraph BLOB["Unstructured · large"]
-        B2[("S3-compatible bucket<br/>audio/stories/*")]
-    end
-    subgraph IMMUTABLE["Immutable · versioned"]
-        SF["staticfiles/<br/>hashed + gzip"]
-    end
-    APP["Django"] --> PG
-    APP --> B2
-    APP --> SF
-    classDef s fill:#4a3e35,stroke:#1a1613,color:#f4f0e6
-    class PG,B2 s
-```
-
-| Asset class | Strategy | Benefit |
-| :--- | :--- | :--- |
-| **Static (CSS/JS/images)** | WhiteNoise `CompressedManifestStaticFilesStorage`: filenames are content-hashed at build time and pre-compressed. | Hashed names allow far-future cache headers safely; compressed variants cut transfer size; no CDN or Nginx required. |
-| **Media (audio)** | `django-storages` `S3Storage` against Backblaze B2. Audio is fetched by the browser **directly from the bucket**, not proxied through Django. | Web workers aren't tied up streaming large files; survives redeploys on an ephemeral filesystem; storage is cheap and scales independently. |
-| **Media URLs** | Generated by the storage backend (query-string-signed by default in `django-storages`). | The bucket can remain private while URLs expire automatically. |
-| **Video** | Not stored at all — only an 11-char YouTube ID. | Zero storage/bandwidth cost for the heaviest media type. |
-| **Orphans** | `django-cleanup` deletes old files when a `FileField` is cleared, replaced or its row deleted. | Prevents silent storage-cost creep. |
-
-### 6.2 S3 compatibility layer
-
-The storage client is configured with a custom `botocore` `Config`:
-
-```text
-request_checksum_calculation  = "when_required"
-response_checksum_validation  = "when_required"
-```
-
-Newer AWS SDK versions attach additional integrity checksums to every upload by default; several S3-compatible providers do not accept these. Opting back to *when required* keeps the SDK current while remaining compatible with non-AWS object storage.
-
-### 6.3 Environment-adaptive storage
-
-```text
-if bucket configured in environment  →  S3Storage (cloud) + WhiteNoise manifest storage
-else                                 →  local MEDIA_ROOT, served by Django only when DEBUG
-```
-
-Developers can run the whole app offline with no cloud credentials, while production automatically switches to durable storage.
-
-### 6.4 Application caching
-
-There is intentionally **no application-level cache** (Redis/Memcached) yet: pages are cheap to render, datasets are small, and the cost/complexity of a cache tier isn't justified at the current scale. Caching is achieved where it matters most — immutable static assets and offloaded media. See [Scalability](#10-scalability--performance) for the planned path.
+- **CSRF Protection:** Enabled globally via `CsrfViewMiddleware`. Every form—including the asynchronous XHR upload (`FormData(form)`) and the `POST`-only logout form—transmits a CSRF token.
+- **Server-Side Authorization:** `delete_story` verifies `story.uploader == request.user` and `story.can_be_deleted` on the server regardless of UI state. `upload` assigns `new_story.uploader = request.user` in the view rather than exposing `uploader` in `StoryForm.Meta.fields`.
+- **XSS & Embed Hardening:** Story narratives are auto-escaped by Django templates (`{{ story.content|linebreaks }}`). YouTube links are stripped down to a regex-verified 11-character video ID (`[a-zA-Z0-9_-]{11}`) and embedded via `https://www.youtube-nocookie.com/embed/<id>` with `referrerpolicy="strict-origin-when-cross-origin"`.
+- **Audio Controls:** The `<audio>` player sets `controlsList="nodownload noplaybackrate"` to discourage casual scraping of oral recordings.
+- **Secret Management:** Production credentials (`SECRET_KEY`, `DATABASE_URL`, `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_ENDPOINT_URL`) are loaded strictly from environment variables.
 
 ---
 
-## 7. Configuration & Environments
+## 7. Scalability & Production Operations
 
-All environment-specific values are injected via environment variables (loaded from a local `.env` during development via `python-dotenv`). **No secret is required to be in source control.**
-
-| Variable | Purpose | Local default |
-| :--- | :--- | :--- |
-| `SECRET_KEY` | Cryptographic signing | Dev-only fallback |
-| `DEBUG` | Debug mode toggle | `True` |
-| `ALLOWED_HOSTS` | Host header allow-list (comma-separated) | `*` |
-| `DATABASE_URL` | Database DSN parsed by `dj-database-url` | SQLite file |
-| `B2_BUCKET_NAME` | Enables cloud media storage when present | unset → local disk |
-| `B2_KEY_ID` / `B2_APPLICATION_KEY` | Bucket credentials | unset |
-| `B2_ENDPOINT_URL` | S3-compatible endpoint | unset |
-
-| Setting | Value | Reason |
-| :--- | :--- | :--- |
-| `conn_max_age` | `0` | A fresh DB connection per request — robust against managed/pooled Postgres providers that drop idle connections. |
-| `FILE_UPLOAD_MAX_MEMORY_SIZE` | 10 MB | Typical voice notes are handled in memory; bigger files spill to disk instead of exhausting worker RAM. |
-| `DATA_UPLOAD_MAX_MEMORY_SIZE` | 10 MB | Caps non-file request body size. |
-| `LOGIN_URL` / `LOGIN_REDIRECT_URL` / `LOGOUT_REDIRECT_URL` | named routes | Auth routing defined once, by name, not hard-coded paths. |
-| `LOGGING` | `django` errors → console | Tracebacks visible in the platform log stream with `DEBUG=False`. |
-| `TIME_ZONE` / `USE_TZ` | `UTC` / `True` | Timezone-aware timestamps, which the 24-hour deletion window depends on. |
-
----
-
-## 8. Build & Deployment Pipeline
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'fontFamily': 'Georgia, serif', 'primaryColor': '#f4f0e6', 'primaryTextColor': '#1a1613', 'primaryBorderColor': '#4a3e35', 'lineColor': '#8c7a6b' }}}%%
-flowchart LR
-    P["git push"] --> R["Render detects commit"]
-    R --> B1["pip install -r requirements.txt<br/>(pinned versions)"]
-    B1 --> B2["collectstatic --no-input<br/>hash + compress assets"]
-    B2 --> B3["migrate<br/>apply schema changes"]
-    B3 --> S["Start: gunicorn Ishlogh.wsgi<br/>--timeout 120"]
-    S --> H["/ping/ monitored externally"]
-    B1 -. "errexit: any failure aborts deploy" .-> X["❌ previous release keeps serving"]
-
-    classDef step fill:#f4f0e6,stroke:#4a3e35,color:#1a1613
-    classDef fail fill:#f4e1e1,stroke:#b33939,color:#1a1613
-    class P,R,B1,B2,B3,S,H step
-    class X fail
-```
-
-- **Pinned dependencies** (`requirements.txt`) make builds reproducible.
-- **Python version is pinned** (`.python-version` → 3.12) so local and production runtimes match.
-- `set -o errexit` ensures a failed install, asset build or migration **fails the deploy** rather than shipping a half-migrated release.
-- An external uptime monitor polls `/ping/`, which avoids free-tier cold starts and provides basic availability alerting.
-
----
-
-## 9. Security Model
-
-| Threat | Mitigation in Ishlogh |
-| :--- | :--- |
-| **CSRF** | `CsrfViewMiddleware` globally; every state-changing form (upload, delete, logout, profile edit, signup) carries `{% csrf_token %}`; the XHR uploader sends it inside `FormData`. Logout is POST-only. |
-| **Broken access control** | `@login_required` on write views; `delete_story` re-checks **ownership** and the **time window** server-side; `uploader` is assigned from `request.user`, never from form data; `story_list` is scoped to `uploader=request.user`. |
-| **Mass assignment** | `ModelForm`s declare explicit `fields` allow-lists (e.g. `StoryForm` excludes `uploader`, `youtube_id`, timestamps). |
-| **XSS** | Django template auto-escaping on all user content; story bodies rendered through `linebreaks` (escapes then formats); YouTube embeds built from a regex-validated ID — never from a raw user URL. |
-| **Clickjacking** | `XFrameOptionsMiddleware` on all responses. |
-| **SQL injection** | All data access through the Django ORM with parameterized queries. |
-| **Credential storage** | Django's PBKDF2 password hashing; four password validators (similarity, minimum length, common-password list, numeric-only). |
-| **Secret leakage** | Secrets injected via environment; `.env`, local DB and media directories git-ignored. |
-| **Third-party tracking** | YouTube served from `youtube-nocookie.com` with a strict referrer policy and lazy loading. |
-| **Content tampering** | 24-hour self-service deletion window, after which content is permanent for contributors; admin-only removal afterwards. |
-| **Upload abuse / DoS** | In-memory buffering capped at 10 MB; bounded worker timeout. |
-
----
-
-## 10. Scalability & Performance
-
-### Current characteristics
-
-- **Horizontally scalable web tier.** Because sessions live in the DB and media in object storage, adding Gunicorn workers or instances requires no sticky sessions or shared disks.
-- **Static traffic bypasses Django.** WhiteNoise answers asset requests at the top of the middleware stack.
-- **Media bandwidth bypasses the app.** Audio streams from the bucket to the browser directly.
-- **Lean queries.** The feed template only touches `title` and `content`, avoiding N+1 relationship lookups; profile stats use DB-side `COUNT(DISTINCT …)` aggregation; "recent stories" uses a SQL `LIMIT 3` slice.
-- **Small payloads.** No frontend framework; per-page stylesheets load only what each page needs; a separate, lighter backdrop image is served to mobile via a media query.
-
-### Scaling path
-
-| Trigger | Next step |
-| :--- | :--- |
-| Feed grows to hundreds of stories | Pagination / keyset pagination on `created_at` + index |
-| Discovery features | PostgreSQL full-text search (`SearchVector`) on title/content, filtered by region/language |
-| Read-heavy traffic | Per-view or template-fragment caching backed by Redis; CDN in front of the bucket |
-| Many relationships on detail pages | `select_related('region', 'language', 'uploader')` |
-| Heavy uploads | Direct-to-bucket presigned uploads from the browser, removing the app server from the upload data path entirely |
-| Connection churn at scale | Enable persistent connections or an external pooler (e.g. PgBouncer) |
-
----
-
-## 11. Trade-offs & Future Work
-
-| Decision | Trade-off accepted | Revisit when |
-| :--- | :--- | :--- |
-| Monolith + SSR | Less "app-like" interactivity | Rich client features (offline recording, maps) are needed |
-| Uploads proxied through Django | Worker occupied during transfer; needs higher timeout | Upload volume grows → presigned direct uploads |
-| No cache tier | Every page hits the DB | Sustained traffic growth |
-| YouTube for video | Dependency on a third-party platform | Need for self-hosted archival-grade video |
-| Function-based views | Some repetition across views | Feature surface grows substantially |
-
-**Planned:** automated test suite with CI, server-side audio type/size validation, search & filters, pagination, i18n for Urdu/Khowar UI, and a region map view.
-
----
-
-<div align="center">
-<sub><a href="./README.md">← Back to README</a> · This document describes architecture only; no proprietary source code is included.</sub>
-</div>
+- **Fail-Fast Build Pipeline (`build.sh`):** Runs with `set -o errexit`, chaining `pip install -r requirements.txt`, `python manage.py collectstatic --no-input`, and `python manage.py migrate`. Any failure halts deployment before traffic switches over.
+- **Cold-Start Mitigation (`/ping/`):** Provides a zero-database-query health check endpoint returning `"OK"`, allowing external uptime monitors (such as UptimeRobot) to keep the Render web instance warm.
+- **Production Error Visibility:** Custom `LOGGING` configuration streams `ERROR`-level tracebacks from the `django` logger directly to `console` (`StreamHandler`) so production 500 errors surface immediately in Render logs even when `DEBUG = False`.
+- **Mobile Bandwidth Optimization:** `master.css` serves a dedicated, compressed mobile backdrop (`backdrop-m.png`) below `600px` viewport widths.
